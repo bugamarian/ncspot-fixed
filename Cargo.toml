@@ -66,6 +66,8 @@ reqwest = {version = "0.13", features = ["blocking", "json"]}
 serde = "1.0"
 serde_cbor = "0.11.2"
 serde_json = "1.0"
+serde_yaml = "0.9"
+open = "5.3"
 strum = "0.27"
 strum_macros = "0.27"
 tokio = {version = "1", features = ["rt-multi-thread", "sync", "time", "net"]}
@@ -80,7 +82,7 @@ signal-hook = "0.4.1"
 
 [dependencies.rspotify]
 default-features = false
-features = ["client-ureq", "ureq-native-tls"]
+features = ["client-ureq", "ureq-native-tls", "cli"]
 version = "0.15.0"
 
 [dependencies.cursive]

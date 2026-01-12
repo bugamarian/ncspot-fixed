@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use crate::application::ASYNC_RUNTIME;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
+use rand::Rng;
 use rspotify::http::HttpError;
 use rspotify::model::{
     AlbumId, AlbumType, ArtistId, CursorBasedPage, EpisodeId, FullAlbum, FullArtist, FullEpisode,
@@ -27,6 +28,9 @@ use crate::model::playlist::Playlist;
 use crate::model::track::Track;
 use crate::spotify_worker::WorkerCommand;
 use crate::ui::pagination::{ApiPage, ApiResult};
+
+const MAX_RETRIES: u32 = 3;
+const MAX_BACKOFF_SECS: u64 = 60;
 
 /// Convenient wrapper around the rspotify web API functionality.
 #[derive(Clone)]
@@ -64,6 +68,15 @@ impl Default for WebApi {
 impl WebApi {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_authenticated_client(api: AuthCodeSpotify) -> Self {
+        Self {
+            api,
+            user: None,
+            worker_channel: Arc::new(RwLock::new(None)),
+            token_expiration: Arc::new(RwLock::new(Utc::now() + ChronoDuration::hours(1))),
+        }
     }
 
     /// Set the username for use with the API.
@@ -127,44 +140,91 @@ impl WebApi {
         }
     }
 
-    /// Execute `api_call` and retry once if a rate limit occurs.
     fn api_with_retry<F, R>(&self, api_call: F) -> Option<R>
     where
         F: Fn(&AuthCodeSpotify) -> ClientResult<R>,
     {
-        let result = { api_call(&self.api) };
-        match result {
-            Ok(v) => Some(v),
-            Err(ClientError::Http(error)) => {
-                debug!("http error: {error:?}");
-                match error.as_ref() {
-                    HttpError::StatusCode(response) => match response.status() {
-                        429 => {
-                            let waiting_duration = response
-                                .header("Retry-After")
-                                .and_then(|v| v.parse::<u64>().ok());
-                            debug!("rate limit hit. waiting {waiting_duration:?} seconds");
-                            thread::sleep(Duration::from_secs(waiting_duration.unwrap_or(0)));
-                            api_call(&self.api).ok()
-                        }
-                        401 => {
-                            debug!("token unauthorized. trying refresh..");
-                            self.update_token()
-                                .and_then(move |_| api_call(&self.api).ok())
-                        }
+        let mut attempt = 0;
+        let mut last_error = None;
+
+        while attempt < MAX_RETRIES {
+            let result = api_call(&self.api);
+            match result {
+                Ok(v) => return Some(v),
+                Err(ClientError::Http(ref error)) => {
+                    debug!("http error (attempt {}): {:?}", attempt + 1, error);
+                    match error.as_ref() {
+                        HttpError::StatusCode(response) => match response.status() {
+                            429 => {
+                                let retry_after = response
+                                    .header("Retry-After")
+                                    .and_then(|v| v.parse::<u64>().ok())
+                                    .unwrap_or(1);
+
+                                let jitter = rand::rng().random_range(0..3);
+                                let base_delay = retry_after + jitter;
+                                let backoff = (base_delay * (1 << attempt)).min(MAX_BACKOFF_SECS);
+
+                                warn!(
+                                    "Rate limited (429). Waiting {} seconds before retry {}/{}",
+                                    backoff,
+                                    attempt + 1,
+                                    MAX_RETRIES
+                                );
+                                thread::sleep(Duration::from_secs(backoff));
+                                attempt += 1;
+                                last_error = Some(format!("Rate limited: {}", response.status()));
+                                continue;
+                            }
+                            401 => {
+                                debug!("Token unauthorized (401). Attempting refresh...");
+                                if let Some(handle) = self.update_token() {
+                                    ASYNC_RUNTIME.get().unwrap().block_on(handle).ok();
+                                    attempt += 1;
+                                    continue;
+                                }
+                                last_error = Some("Token refresh failed".to_string());
+                                break;
+                            }
+                            502..=504 => {
+                                let backoff = (2u64.pow(attempt)).min(MAX_BACKOFF_SECS);
+                                warn!(
+                                    "Server error ({}). Waiting {} seconds before retry {}/{}",
+                                    response.status(),
+                                    backoff,
+                                    attempt + 1,
+                                    MAX_RETRIES
+                                );
+                                thread::sleep(Duration::from_secs(backoff));
+                                attempt += 1;
+                                last_error = Some(format!("Server error: {}", response.status()));
+                                continue;
+                            }
+                            status => {
+                                error!("Unhandled HTTP status: {}", status);
+                                last_error = Some(format!("HTTP error: {}", status));
+                                break;
+                            }
+                        },
                         _ => {
-                            error!("unhandled api error: {response:?}");
-                            None
+                            error!("Unknown HTTP error");
+                            last_error = Some("Unknown HTTP error".to_string());
+                            break;
                         }
-                    },
-                    _ => None,
+                    }
+                }
+                Err(e) => {
+                    error!("API error: {}", e);
+                    last_error = Some(format!("API error: {}", e));
+                    break;
                 }
             }
-            Err(e) => {
-                error!("unhandled api error: {e}");
-                None
-            }
         }
+
+        if let Some(err) = last_error {
+            error!("API call failed after {} attempts: {}", attempt, err);
+        }
+        None
     }
 
     /// Append `tracks` at `position` in the playlist with `playlist_id`.

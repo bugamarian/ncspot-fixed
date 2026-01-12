@@ -10,6 +10,7 @@ use log::{error, info, trace};
 #[cfg(unix)]
 use signal_hook::{consts::SIGHUP, consts::SIGTERM, iterator::Signals};
 
+use crate::client_config::ClientConfig;
 use crate::command::Command;
 use crate::commands::CommandManager;
 use crate::config::{Config, PlaybackState};
@@ -17,6 +18,7 @@ use crate::events::{Event, EventManager};
 use crate::library::Library;
 use crate::queue::Queue;
 use crate::spotify::{PlayerEvent, Spotify};
+use crate::spotify_api::WebApi;
 use crate::ui::create_cursive;
 use crate::{authentication, ui, utils};
 use crate::{command, queue, spotify};
@@ -94,8 +96,13 @@ impl Application {
             .unwrap();
 
         let configuration = Arc::new(Config::new(configuration_file_path));
-        let credentials = authentication::get_credentials(&configuration)?;
         let theme = configuration.build_theme();
+
+        let mut client_config = ClientConfig::new();
+        client_config.load_config()?;
+
+        println!("Authenticating with Spotify...");
+        let auth_result = authentication::authenticate(&client_config, &configuration)?;
 
         println!("Connecting to Spotify..");
 
@@ -111,8 +118,13 @@ impl Application {
 
         let event_manager = EventManager::new(cursive.cb_sink().clone());
 
-        let mut spotify =
-            spotify::Spotify::new(event_manager.clone(), credentials, configuration.clone())?;
+        let mut spotify = spotify::Spotify::new(
+            event_manager.clone(),
+            auth_result.librespot_credentials,
+            configuration.clone(),
+        )?;
+
+        spotify.api = WebApi::with_authenticated_client(auth_result.web_api);
 
         let library = Arc::new(Library::new(
             event_manager.clone(),
